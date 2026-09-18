@@ -1,0 +1,38 @@
+# 依赖
+node_modules
+
+# 构建产物
+out
+dist
+dist3
+release
+
+# 程序生成的图片输出
+output
+
+# 跑批测试夹具（里面是真实底图/表格/生成的图，不要上传）
+_packtest
+_cwttest
+_datetest
+_*test
+
+# 业务数据：表格一律不上传
+*.xlsx
+*.xls
+*.csv
+
+# 根目录的临时素材（底图等）
+/*.png
+/*.jpg
+/*.jpeg
+
+# 打包产物与字体
+*.exe
+TFF
+*.ttf
+*.otf
+
+# 系统与日志
+.DS_Store
+Thumbs.db
+*.log
