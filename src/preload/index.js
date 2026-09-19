@@ -14,6 +14,22 @@ const api = {
   writeImages: (payload) => ipcRenderer.invoke('file:writeImages', payload),
   exportPack: (payload) => ipcRenderer.invoke('pack:export', payload),
 
+  app: {
+    /** 界面处理完「退出前保存」后放行关闭 */
+    confirmClose: () => ipcRenderer.invoke('app:confirmClose'),
+    /** 主进程拦下关闭时通知界面 */
+    onBeforeClose: (cb) => ipcRenderer.on('app:beforeClose', () => cb()),
+  },
+
+  config: {
+    getDir: () => ipcRenderer.invoke('config:getDir'),
+    list: () => ipcRenderer.invoke('config:list'),
+    save: (payload) => ipcRenderer.invoke('config:save', payload),
+    load: (filePath) => ipcRenderer.invoke('config:load', filePath),
+    remove: (filePath) => ipcRenderer.invoke('config:remove', filePath),
+    rename: (payload) => ipcRenderer.invoke('config:rename', payload),
+  },
+
   batch: {
     readConfig: () => ipcRenderer.invoke('batch:readConfig'),
     write: (payload) => ipcRenderer.invoke('batch:write', payload),

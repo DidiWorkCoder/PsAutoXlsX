@@ -51,6 +51,10 @@ export const state = reactive({
   },
 
   theme: 'light',
+
+  // 本机历史配置
+  configFile: '',
+  configName: '',
 });
 
 /** 不参与响应式的运行时对象（DOM 元素、解析后的工作簿） */
@@ -377,3 +381,127 @@ export async function initApp() {
   state.appVersion = paths.version;
   if (!state.output.dir) state.output.dir = `${paths.baseDir}\\output`;
 }
+
+/* ------------------------------ 本机历史配置 ------------------------------ */
+
+/** 当前界面的完整快照：存绝对路径，供本机复用（与分发用的 config.json 不同） */
+export function snapshotConfig() {
+  return {
+    version: 1,
+    kind: 'workspace',
+    name: state.configName || '',
+    savedAt: new Date().toISOString(),
+    imagePath: state.imagePath,
+    imageName: state.imageName,
+    tablePath: state.tablePath,
+    tableName: state.tableFileName,
+    fontPath: state.fontPath,
+    fontName: state.fontFileName,
+    sheetName: state.sheetName,
+    skipRows: state.skipRows,
+    firstRowAsHeader: state.firstRowAsHeader,
+    nameColumn: state.nameColumn,
+    boxes: serializeBoxes(),
+    output: {
+      dir: state.output.dir,
+      dirName: state.output.dirName,
+      format: state.output.format,
+      prefix: state.output.prefix,
+      suffix: state.output.suffix,
+    },
+  };
+}
+
+/** 把一份历史配置载回界面；文件丢失只记警告，不中断 */
+export async function applyWorkspaceConfig(cfg, filePath = '') {
+  const warnings = [];
+  const attempt = async (fn, label, reset) => {
+    try {
+      const r = await fn();
+      if (!r || r.ok === false) {
+        warnings.push(`${label}读取失败${r?.message ? `：${r.message}` : ''}`);
+        reset?.();
+      }
+    } catch (err) {
+      warnings.push(`${label}读取失败：${err.message}`);
+      reset?.();
+    }
+  };
+
+  resetWorkspace({ keepOutput: true });
+
+  if (cfg.imagePath) await attempt(() => loadImageByPath(cfg.imagePath), '底图');
+  if (cfg.fontPath) await attempt(() => loadFontByPath(cfg.fontPath), '字体');
+  if (cfg.tablePath) {
+    await attempt(() => loadTableByPath(cfg.tablePath, cfg.sheetName), '表格', () => {
+      state.rows = [];
+      state.colCount = 0;
+      state.sheetNames = [];
+      state.sheetName = '';
+      runtime.workbook = null;
+      runtime.dateSerials = [];
+    });
+  }
+
+  // 这些设置必须放在表格载入之后：applySheet 会把 nameColumn 重置为 A
+  state.skipRows = Number(cfg.skipRows) || 0;
+  state.firstRowAsHeader = cfg.firstRowAsHeader !== false;
+  state.nameColumn = cfg.nameColumn || (state.colCount ? 'A' : '');
+  state.previewRowIndex = 0;
+
+  const boxes = (cfg.boxes || []).map((b) => createBox({ ...b }));
+  state.boxes.splice(0, state.boxes.length, ...boxes);
+  state.selectedId = boxes[0]?.id || '';
+
+  if (cfg.output) {
+    state.output.dir = cfg.output.dir || state.output.dir;
+    state.output.dirName = cfg.output.dirName || 'output';
+    state.output.format = cfg.output.format === 'jpg' ? 'jpg' : 'png';
+    state.output.prefix = cfg.output.prefix || '';
+    state.output.suffix = cfg.output.suffix || '';
+  }
+
+  state.configFile = filePath;
+  state.configName = cfg.name || '';
+  return { warnings };
+}
+
+/** 清空为一个全新工作区，keepOutput 为真时保留输出设置 */
+export function resetWorkspace({ keepOutput = false } = {}) {
+  runtime.imageEl = null;
+  runtime.workbook = null;
+  runtime.dateSerials = [];
+  Object.assign(state, {
+    imagePath: '',
+    imageName: '',
+    imageUrl: '',
+    imageW: 0,
+    imageH: 0,
+    fontPath: '',
+    fontFileName: '',
+    fontFamily: '',
+    tablePath: '',
+    tableFileName: '',
+    sheetNames: [],
+    sheetName: '',
+    rows: [],
+    colCount: 0,
+    skipRows: 0,
+    firstRowAsHeader: true,
+    nameColumn: '',
+    boxes: [],
+    selectedId: '',
+    previewRowIndex: 0,
+    zoom: 1,
+    configFile: '',
+    configName: '',
+  });
+  if (!keepOutput) {
+    state.output.dir = state.paths.baseDir ? `${state.paths.baseDir}\\output` : '';
+    state.output.dirName = 'output';
+    state.output.format = 'png';
+    state.output.prefix = '';
+    state.output.suffix = '';
+  }
+}
+

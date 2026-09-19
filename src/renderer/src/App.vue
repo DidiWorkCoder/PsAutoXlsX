@@ -40,10 +40,12 @@
               <a-tag v-if="state.tableFileName" color="green" style="margin: 0">{{ state.tableFileName }}</a-tag>
               <a-tag v-if="state.fontFileName" color="purple" style="margin: 0">{{ state.fontFileName }}</a-tag>
               <a-tag v-else color="default" style="margin: 0">默认字体</a-tag>
+              <a-tag v-if="state.configName" color="gold" style="margin: 0">配置：{{ state.configName }}</a-tag>
             </div>
             <div class="header-sub">{{ subtitle }}</div>
           </div>
           <div class="header-actions">
+            <a-button @click="openStartup">历史 / 新建</a-button>
             <a-button @click="onPickImage">选择底图</a-button>
             <a-button @click="onPickTable">导入表格</a-button>
             <a-button @click="onPickFont">导入字体</a-button>
@@ -69,6 +71,27 @@
         </div>
       </div>
     </div>
+    <StartupDialog v-model:open="startupOpen" :dismissible="startupDismissible" @manage="configOpen = true" />
+    <ConfigManager v-model:open="configOpen" />
+
+    <a-modal
+      :open="closeAskOpen"
+      title="退出前保存配置？"
+      :width="420"
+      :footer="null"
+      :closable="false"
+      :maskClosable="false"
+      :keyboard="false"
+    >
+      <div class="set-tip">
+        当前工作区<template v-if="state.configName">「{{ state.configName }}」</template>的改动还没保存，直接退出会丢失。
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px">
+        <a-button @click="closeAskOpen = false">取消</a-button>
+        <a-button @click="onExitWithoutSave">不保存退出</a-button>
+        <a-button type="primary" :loading="savingOnExit" @click="onExitWithSave">保存并退出</a-button>
+      </div>
+    </a-modal>
   </a-config-provider>
 </template>
 
@@ -76,15 +99,23 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { message, theme } from 'ant-design-vue';
 import CanvasEditor from './components/CanvasEditor.vue';
+import ConfigManager from './components/ConfigManager.vue';
 import DataPanel from './components/DataPanel.vue';
 import OutputPanel from './components/OutputPanel.vue';
+import StartupDialog from './components/StartupDialog.vue';
 import TextBoxPanel from './components/TextBoxPanel.vue';
 import { letterToIndex } from './core/table';
-import { addBox, dataRows, generateImages, initApp, pickFont, pickImage, pickTable, state } from './core/store';
+import { addBox, dataRows, generateImages, initApp, pickFont, pickImage, pickTable, snapshotConfig, state } from './core/store';
 
 const tab = ref('data');
 const generating = ref(false);
 const progress = ref('');
+const configOpen = ref(false);
+const startupOpen = ref(false);
+/** 启动时必须先选一个；手动点「历史 / 新建」打开时允许直接关掉 */
+const startupDismissible = ref(false);
+const closeAskOpen = ref(false);
+const savingOnExit = ref(false);
 
 const antdTheme = computed(() => ({
   algorithm: state.theme === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
@@ -164,5 +195,65 @@ async function onGenerate() {
   }
 }
 
-onMounted(initApp);
+/** 启动即弹出选择窗：载入历史配置，或新建空白配置 */
+async function bootstrap() {
+  await initApp();
+  startupDismissible.value = false;
+  startupOpen.value = true;
+}
+
+/** 头部入口：同一个弹窗，但不强制选择，可以直接关掉 */
+function openStartup() {
+  startupDismissible.value = true;
+  startupOpen.value = true;
+}
+
+/** 退出前的默认配置名 */
+function closeConfigName() {
+  const base = (state.imageName || '').replace(/\.[^.]+$/, '');
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return base ? `${base}_配置` : `新配置_${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+/** 主进程拦下了关闭，问要不要保存 */
+function askBeforeClose() {
+  // 还没选底图，没什么可存的，直接放行
+  if (!state.imagePath) {
+    window.api.app.confirmClose();
+    return;
+  }
+  closeAskOpen.value = true;
+}
+
+function onExitWithoutSave() {
+  closeAskOpen.value = false;
+  window.api.app.confirmClose();
+}
+
+async function onExitWithSave() {
+  savingOnExit.value = true;
+  try {
+    const name = state.configName || closeConfigName();
+    const data = snapshotConfig();
+    data.name = name;
+    const res = await window.api.config.save({ path: state.configFile || '', name, data, overwrite: true });
+    if (!res || !res.ok) {
+      message.error((res && res.message) || '保存失败');
+      return;
+    }
+    state.configFile = res.path;
+    state.configName = name;
+    message.success(`已保存到 ${res.path}`);
+    closeAskOpen.value = false;
+    window.api.app.confirmClose();
+  } finally {
+    savingOnExit.value = false;
+  }
+}
+
+onMounted(() => {
+  window.api.app.onBeforeClose(askBeforeClose);
+  bootstrap();
+});
 </script>

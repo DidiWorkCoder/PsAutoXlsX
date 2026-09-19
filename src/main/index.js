@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
-import { basename, dirname, extname, join, isAbsolute } from 'path';
+import { basename, dirname, extname, join, isAbsolute, resolve } from 'path';
 import fs from 'fs';
 
 /** 是否强制显示界面 */
@@ -14,6 +14,8 @@ let mainWindow = null;
 let batchConfigPath = '';
 /** 跑批模式下的工作目录（exe 所在目录） */
 let batchBaseDir = '';
+/** 界面已确认可以关闭（用于「退出前保存」拦截） */
+let allowClose = false;
 
 const IMAGE_EXT = ['png', 'jpg', 'jpeg', 'bmp', 'webp'];
 const FONT_EXT = ['ttf', 'otf', 'woff', 'woff2'];
@@ -47,6 +49,12 @@ function createWindow() {
   });
   mainWindow.setMenuBarVisibility(false);
   mainWindow.once('ready-to-show', () => mainWindow.show());
+  // 拦截关闭：先问渲染进程要不要保存配置，确认后才真正退出
+  mainWindow.on('close', (e) => {
+    if (allowClose) return;
+    e.preventDefault();
+    mainWindow.webContents.send('app:beforeClose');
+  });
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -112,6 +120,44 @@ function resolveSelfExe() {
   if (!app.isPackaged) return '';
   if (process.env.PORTABLE_EXECUTABLE_FILE) return process.env.PORTABLE_EXECUTABLE_FILE;
   return app.getPath('exe');
+}
+
+/** 工作配置目录：exe（开发时为项目根）同级的 config 文件夹 */
+function workspaceConfigDir() {
+  const base = app.isPackaged ? resolveBaseDir() : process.cwd();
+  return join(base, 'config');
+}
+
+/** 配置文件名安全化：去掉 Windows 不允许的字符 */
+function safeFileStem(raw) {
+  const s = String(raw ?? '')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/[\r\n\t]/g, ' ')
+    .trim()
+    .replace(/[. ]+$/, '');
+  return s || `配置_${Date.now()}`;
+}
+
+/** 读配置：文件夹取里面的 config.json；旧版单文件配置直接用 */
+function configJsonPath(p) {
+  if (!p) return '';
+  try {
+    if (fs.statSync(p).isDirectory()) return join(p, 'config.json');
+  } catch {
+    /* 不存在，按文件处理 */
+  }
+  return p;
+}
+
+/** 写配置：统一落到文件夹，旧版单文件会升级成同名文件夹 */
+function configFolderOf(p) {
+  if (!p) return '';
+  try {
+    if (fs.statSync(p).isDirectory()) return p;
+  } catch {
+    /* 不存在，按文件路径推断 */
+  }
+  return p.replace(/\.json$/i, '');
 }
 
 function mimeOf(file) {
@@ -293,6 +339,162 @@ function registerIpc() {
     await fs.promises.writeFile(join(target, 'config.json'), JSON.stringify(config, null, 2), 'utf8');
 
     return { ok: true, target, copied, exeMissing: !copied.exe };
+  });
+
+  /** 界面处理完「退出前保存」后放行关闭 */
+  ipcMain.handle('app:confirmClose', () => {
+    allowClose = true;
+    if (mainWindow) mainWindow.close();
+    return true;
+  });
+
+  /** 本机工作配置目录（config 文件夹） */
+  ipcMain.handle('config:getDir', () => workspaceConfigDir());
+
+  /** 列出 config 目录下的历史配置，按保存时间倒序 */
+  ipcMain.handle('config:list', async () => {
+    const dir = workspaceConfigDir();
+    if (!fs.existsSync(dir)) return { dir, items: [] };
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    const items = [];
+    for (const ent of entries) {
+      const full = join(dir, ent.name);
+      const json = ent.isDirectory()
+        ? join(full, 'config.json')
+        : ent.name.toLowerCase().endsWith('.json')
+          ? full
+          : '';
+      if (!json || !fs.existsSync(json)) continue;
+      try {
+        const cfg = JSON.parse(await fs.promises.readFile(json, 'utf8'));
+        items.push({
+          file: ent.name,
+          path: full,
+          name: cfg.name || ent.name.replace(/\.json$/i, ''),
+          savedAt: cfg.savedAt || '',
+          imageName: cfg.imageName || basename(cfg.image || cfg.imagePath || ''),
+          tableName: cfg.tableName || basename(cfg.table || cfg.tablePath || ''),
+          boxCount: Array.isArray(cfg.boxes) ? cfg.boxes.length : 0,
+          built: cfg.kind === 'workspace',
+        });
+      } catch {
+        /* 忽略无法解析的文件 */
+      }
+    }
+    // 本工具保存的配置排在前面（kind 为 workspace），再按时间倒序
+    items.sort((a, b) => Number(b.built) - Number(a.built) || String(b.savedAt).localeCompare(String(a.savedAt)));
+    return { dir, items };
+  });
+
+  /**
+   * 保存配置：一份配置 = 一个自包含文件夹
+   *   文件夹里放 config.json + 底图 + 表格 + 字体，原文件丢了也能从这里找回来
+   *   传 path        → 覆盖写入该配置（文件夹，或旧的单文件 json）
+   *   传 dir + name  → 写入 dir/<name>/
+   *   都不传          → 写入默认 config 目录/<name>/
+   */
+  ipcMain.handle('config:save', async (_e, payload) => {
+    const { path, dir, name, data, overwrite = false } = payload || {};
+    const folder = path
+      ? configFolderOf(path)
+      : join(dir || workspaceConfigDir(), safeFileStem(name));
+    const target = join(folder, 'config.json');
+
+    if (!overwrite && fs.existsSync(target)) {
+      return { ok: false, exists: true, path: folder, file: 'config.json' };
+    }
+
+    await fs.promises.mkdir(folder, { recursive: true });
+
+    // 把底图 / 表格 / 字体一起拷进配置文件夹
+    const copied = { image: '', table: '', font: '' };
+    for (const key of Object.keys(copied)) {
+      const src = data && data[`${key}Path`];
+      if (!src || !fs.existsSync(src)) continue;
+      const fileName = basename(src);
+      const dest = join(folder, fileName);
+      if (resolve(dest) !== resolve(src)) await fs.promises.copyFile(src, dest);
+      copied[key] = fileName;
+    }
+
+    // 清掉上次保存留下、这次已经不用了的文件
+    const keep = new Set(['config.json', ...Object.values(copied).filter(Boolean)]);
+    for (const n of await fs.promises.readdir(folder)) {
+      if (!keep.has(n)) await fs.promises.rm(join(folder, n), { recursive: true, force: true });
+    }
+
+    const record = {
+      ...(data || {}),
+      name: name || (data && data.name) || '',
+      folder: true,
+      savedAt: new Date().toISOString(),
+      image: copied.image,
+      table: copied.table,
+      font: copied.font,
+    };
+    // 存的是文件夹内的相对文件名，整个文件夹搬走也还能用
+    delete record.imagePath;
+    delete record.tablePath;
+    delete record.fontPath;
+
+    await fs.promises.writeFile(target, JSON.stringify(record, null, 2), 'utf8');
+    // 旧版单文件配置已升级成文件夹，删掉原文件
+    if (path && resolve(path) !== resolve(target) && fs.existsSync(path)) {
+      await fs.promises.rm(path, { force: true });
+    }
+    return { ok: true, path: folder, file: 'config.json', dir: folder };
+  });
+
+  /** 读取一份配置原文；文件夹里存的相对文件名在这里还原成绝对路径 */
+  ipcMain.handle('config:load', async (_e, filePath) => {
+    const json = configJsonPath(filePath);
+    if (!json || !fs.existsSync(json)) return { ok: false, message: '配置文件不存在' };
+    try {
+      const cfg = JSON.parse(await fs.promises.readFile(json, 'utf8'));
+      const base = dirname(json);
+      const abs = (rel, old) => (rel ? (isAbsolute(rel) ? rel : join(base, rel)) : old || '');
+      cfg.imagePath = abs(cfg.image, cfg.imagePath);
+      cfg.tablePath = abs(cfg.table, cfg.tablePath);
+      cfg.fontPath = abs(cfg.font, cfg.fontPath);
+      return { ok: true, path: filePath, config: cfg };
+    } catch {
+      return { ok: false, message: '配置文件格式不正确' };
+    }
+  });
+
+  /** 删除一份配置（整个文件夹一起删） */
+  ipcMain.handle('config:remove', async (_e, filePath) => {
+    if (!filePath || !fs.existsSync(filePath)) return { ok: false, message: '配置文件不存在' };
+    await fs.promises.rm(filePath, { recursive: true, force: true });
+    return { ok: true };
+  });
+
+  /** 重命名：文件夹名与内部 name 一起改 */
+  ipcMain.handle('config:rename', async (_e, { filePath, name } = {}) => {
+    if (!filePath || !fs.existsSync(filePath)) return { ok: false, message: '配置文件不存在' };
+    let cfg;
+    try {
+      cfg = JSON.parse(await fs.promises.readFile(configJsonPath(filePath), 'utf8'));
+    } catch {
+      return { ok: false, message: '配置文件格式不正确' };
+    }
+    cfg.name = name;
+    const isFolder = fs.statSync(filePath).isDirectory();
+
+    if (!isFolder) {
+      // 旧版单文件
+      const target = join(dirname(filePath), `${safeFileStem(name)}.json`);
+      if (target !== filePath && fs.existsSync(target)) return { ok: false, message: '已有同名配置' };
+      await fs.promises.writeFile(filePath, JSON.stringify(cfg, null, 2), 'utf8');
+      if (target !== filePath) await fs.promises.rename(filePath, target);
+      return { ok: true, path: target, file: basename(target) };
+    }
+
+    const targetFolder = join(dirname(filePath), safeFileStem(name));
+    if (targetFolder !== filePath && fs.existsSync(targetFolder)) return { ok: false, message: '已有同名配置' };
+    if (targetFolder !== filePath) await fs.promises.rename(filePath, targetFolder);
+    await fs.promises.writeFile(join(targetFolder, 'config.json'), JSON.stringify(cfg, null, 2), 'utf8');
+    return { ok: true, path: targetFolder, file: 'config.json' };
   });
 
   /** 跑批：主进程读配置原文交给渲染进程 */

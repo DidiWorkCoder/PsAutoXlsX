@@ -1,6 +1,6 @@
 {
   "name": "psauto",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "批量图片文字生成器",
   "main": "./out/main/index.js",
   "type": "commonjs",
